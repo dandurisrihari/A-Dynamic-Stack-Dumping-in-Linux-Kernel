@@ -1,0 +1,331 @@
+diff -uNr kernel.old/arch/x86/syscalls/syscall_32.tbl kernel.new/arch/x86/syscalls/syscall_32.tbl
+--- kernel.old/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel.new/arch/x86/syscalls/syscall_32.tbl	2020-05-01 13:52:27.910318789 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump			sys_insdump
++360	i386	rmdump			sys_rmdump
+\ No newline at end of file
+diff -uNr kernel.old/include/linux/dynamic_dump_stack.h kernel.new/include/linux/dynamic_dump_stack.h
+--- kernel.old/include/linux/dynamic_dump_stack.h	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/include/linux/dynamic_dump_stack.h	2020-05-01 13:52:27.914318789 -0700
+@@ -0,0 +1,9 @@
++
++#define MAX_SYMBOL_LEN 256
++
++extern struct list_head dump_stack_list;
++
++struct dumpmode_t {
++	unsigned int mode;
++};
++typedef struct dumpmode_t dumpmode_t;
+\ No newline at end of file
+diff -uNr kernel.old/include/linux/syscalls.h kernel.new/include/linux/syscalls.h
+--- kernel.old/include/linux/syscalls.h	2017-06-17 10:44:57.000000000 -0700
++++ kernel.new/include/linux/syscalls.h	2020-05-01 13:52:27.910318789 -0700
+@@ -67,6 +67,9 @@
+ struct sigaltstack;
+ union bpf_attr;
+ 
++
++struct dumpmode_t;
++
+ #include <linux/types.h>
+ #include <linux/aio_abi.h>
+ #include <linux/capability.h>
+@@ -881,5 +884,7 @@
+ asmlinkage long sys_execveat(int dfd, const char __user *filename,
+ 			const char __user *const __user *argv,
+ 			const char __user *const __user *envp, int flags);
++asmlinkage long sys_insdump(const char __user *symbolname, struct dumpmode_t __user * dumpmode);
+ 
++asmlinkage long sys_rmdump(int dumpid);
+ #endif
+diff -uNr kernel.old/lib/dynamic_dump_stack.c kernel.new/lib/dynamic_dump_stack.c
+--- kernel.old/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel.new/lib/dynamic_dump_stack.c	2020-05-01 13:52:27.910318789 -0700
+@@ -0,0 +1,240 @@
++#include<linux/kernel.h>
++#include<linux/init.h>
++#include<linux/sched.h>
++#include<linux/syscalls.h>
++#include<linux/string.h>
++#include<linux/kprobes.h>
++#include<linux/kallsyms.h>
++#include<linux/module.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <linux/kthread.h>
++#include <linux/mutex.h>
++#include <asm/uaccess.h>
++
++#include <linux/dynamic_dump_stack.h>
++
++//defining all mutex locks
++static DEFINE_MUTEX(list_add_lock);
++static DEFINE_MUTEX(list_delete_lock);
++static DEFINE_MUTEX(list_delete_lock_exit);
++
++//intializing dumpstackmode 
++static unsigned int dumpstackid=10;
++
++//maintaining a list to store all inserted probes
++struct list_head dump_stack_list = LIST_HEAD_INIT(dump_stack_list);
++
++//counter for one time intializing of exit_probe
++int counter=0;
++
++//process exit probe
++struct kprobe process_exit_probe;
++
++//per device structure to store all data
++struct dump_stack_struct{
++
++	unsigned int dump_stackid; 
++	char symbol_name[MAX_SYMBOL_LEN];
++	struct kprobe dump_kp;
++	pid_t pid;   
++	pid_t thread_group_id;  
++	unsigned int dump_stack_mode;  
++	struct list_head dlist;
++	pid_t real_parent_id;
++
++
++};
++
++
++//insdump pre handler probed at given address symbol
++int Pre_Handler(struct kprobe *probe, struct pt_regs *regs){
++	
++	struct task_struct* present_task = current;
++    struct dump_stack_struct *present_dump_stack_ptr;
++
++    pid_t tgid;
++    pid_t pid;
++    pid_t real_parent_id;
++
++    tgid = present_task->tgid;
++    pid = present_task->pid;
++    real_parent_id=present_task->real_parent->pid;
++
++    present_dump_stack_ptr=container_of(probe, struct dump_stack_struct, dump_kp);
++
++	printk(KERN_INFO "INCOMING PROCESS PID IS %d \n",pid);
++	printk(KERN_INFO "INCOMING PROCESS TGID IS %d \n",tgid);
++	printk(KERN_INFO "INCOMING PROCESS REAL_PARENT_ID IS %d \n",real_parent_id);
++
++	printk(KERN_INFO "MAIN PROCESS PID IS %d \n",present_dump_stack_ptr->pid);
++	printk(KERN_INFO "MAIN PROCESS TGID IS %d \n",present_dump_stack_ptr->thread_group_id);
++	printk(KERN_INFO "MAIN PROCESS REAL_PARENT_ID IS %d \n",present_dump_stack_ptr->real_parent_id);
++
++	//print dumpstack for any process
++    if((present_dump_stack_ptr->dump_stack_mode!=1)&&(present_dump_stack_ptr->dump_stack_mode!=0)){   
++   		dump_stack();
++    }
++    //print dumpstack only for the owner process
++    else if((present_dump_stack_ptr->dump_stack_mode == 0) && (pid == present_dump_stack_ptr->pid)){   
++   		dump_stack();
++    }
++    //print dumpstack for owner and any process whose parent process as the owner
++    else if((present_dump_stack_ptr->dump_stack_mode == 1 )&& ((pid == present_dump_stack_ptr->pid) || (tgid == present_dump_stack_ptr->thread_group_id)||(real_parent_id==present_dump_stack_ptr->real_parent_id))){            
++   		dump_stack();
++    }
++    return 0;
++}
++
++
++//when any process exits it hits this pre handler 
++int Exit_Pre_Handler(struct kprobe *probe, struct pt_regs *regs){
++	// printk(KERN_INFO "INSIDE THE EXIT_PRE_HANDLER \n");
++	mutex_lock_interruptible (&list_delete_lock_exit);
++    struct task_struct* present_task = current;
++    pid_t pid=present_task->pid;
++	struct dump_stack_struct* iter= NULL;
++	struct dump_stack_struct* next= NULL;
++	//iterating over dump_stack_list
++    list_for_each_entry_safe(iter,next,&dump_stack_list,dlist){
++		if(iter->pid == pid){   //removing all probes inserted by the process
++			printk(KERN_INFO "PROBES - SYMBOL %s PROCESS PID %d IS EXITED. REMOVING THE KRPOBES\n", iter->symbol_name, iter->pid);
++			unregister_kprobe(&iter->dump_kp);  
++			list_del(&iter->dlist);
++			kfree(iter);
++		}
++    }
++    mutex_unlock(&list_delete_lock_exit);
++	return 0;
++}
++
++
++//system call rmdump
++SYSCALL_DEFINE1(rmdump, int, dumpid){
++
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++		mutex_lock_interruptible (&list_delete_lock);
++	    struct task_struct* present_task = current;
++	    pid_t pid = present_task->pid;
++	    printk(KERN_INFO "IN THE SYSCALL RMDUMP\n");	
++		struct dump_stack_struct* iter= NULL;
++		struct dump_stack_struct* next= NULL;
++
++	    //iterating over dump_stack_list
++    	list_for_each_entry_safe(iter,next,&dump_stack_list,dlist){
++    		//only parent can remove checking the condition
++			if((iter->dump_stackid == dumpid) && (iter->pid == pid)){
++				printk(KERN_INFO "DUMPSTACK FOUND!! REMOVING THE PROBE\n");
++				unregister_kprobe(&iter->dump_kp);
++				list_del(&iter->dlist);
++				kfree(iter);
++    			mutex_unlock(&list_delete_lock);	  
++				return 1;
++			}
++
++    	}
++		printk(KERN_INFO "DUMPSTACK NOT FOUND\n");
++    	mutex_unlock(&list_delete_lock);	  
++		return -EINVAL;
++
++	#else
++		return 0;
++	#endif
++  
++}
++
++
++//system call insdump
++SYSCALL_DEFINE2(insdump,const char __user *, symbolname, dumpmode_t __user *, dumpmode){
++	  	
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++
++		struct task_struct* present_task=NULL;
++		unsigned long int pre_hand_address=0,exit_pre_address=0;
++		char *symbol_name=NULL;	
++		dumpmode_t dump_mode;	
++		unsigned long bytes=0;
++		struct dump_stack_struct *per_dev_node=NULL;
++
++		printk(KERN_INFO "INSIDE THE SYSTEM CALL INSDUMP\n");
++
++		symbol_name = (char *)kmalloc(sizeof(char)*MAX_SYMBOL_LEN, GFP_KERNEL);
++		bytes=strncpy_from_user((char *)symbol_name,symbolname,MAX_SYMBOL_LEN);
++
++		if(bytes==0){
++			printk(KERN_INFO "ERROR IN COPYING SYMOBOLNAME \n");
++			return -EINVAL;
++		}	
++
++		printk(KERN_INFO"COPYIED SYMBOL IS %s \n",symbol_name);
++
++		pre_hand_address = kallsyms_lookup_name(symbol_name); 
++		//checking address is correct or not
++		if(pre_hand_address == 0){  
++			printk(KERN_INFO "INSDUMP SYMBOL NOT FOUND\n");
++			return -EINVAL;
++		}
++
++		printk(KERN_INFO "SYMOBOL PRESENT \n");
++		per_dev_node = (struct dump_stack_struct *)kmalloc(sizeof(struct dump_stack_struct), GFP_KERNEL);
++		memset((void *)per_dev_node, 0, sizeof(struct dump_stack_struct));
++		bytes=copy_from_user((void *)&dump_mode,(const void __user *)dumpmode,sizeof(dump_mode));
++		//checking data copied or not
++		if(bytes){
++			printk(KERN_INFO "ERROR IN COPYING DUMPMODE \n");
++			return -EINVAL;
++		}
++
++		printk(KERN_INFO "DUMPSTACK MODE COPYIED IS  %d\n", dump_mode.mode);
++		//storing all the parent process info
++		present_task = current;
++		per_dev_node->pid = present_task->pid;
++		per_dev_node->thread_group_id = present_task->tgid;
++		per_dev_node->real_parent_id=present_task->real_parent->pid;
++		per_dev_node->dump_stack_mode = dump_mode.mode;
++		strcpy((char *)&per_dev_node->symbol_name,symbol_name);
++		memset(&per_dev_node->dump_kp, 0, sizeof(struct kprobe));
++		per_dev_node->dump_kp.pre_handler = Pre_Handler;
++	    per_dev_node->dump_kp.addr = (kprobe_opcode_t *)pre_hand_address;
++		per_dev_node->dump_stackid = dumpstackid++;
++
++		printk(KERN_INFO "REGISTERING INSDUMP KPROBE AT ADDRESS %p\n", (void*)(pre_hand_address));
++		// register the krpobe
++		if(register_kprobe(&per_dev_node->dump_kp)){
++			printk(KERN_INFO "ERROR WHILE KEEPING KPROBE AT INSDUMP ADDRESS  %p\n", (void*)(pre_hand_address));
++			return -EINVAL;
++		}
++		//putting a probe at do_exiit
++		if(counter==0){   //regestering the kprobe once
++			exit_pre_address = kallsyms_lookup_name("do_exit"); 
++			if(exit_pre_address == 0){  
++				printk(KERN_INFO "DO_EXIT SYMBOL NOT FOUND\n");
++				return -EINVAL;
++			}
++			memset(&process_exit_probe, 0, sizeof(struct kprobe));
++			process_exit_probe.pre_handler = Exit_Pre_Handler;
++			process_exit_probe.addr = (kprobe_opcode_t *)exit_pre_address;
++			printk(KERN_INFO "DO_EXIT SYMBOL FOUND\n");
++			printk(KERN_INFO "REGISTERING PROCESS EXIT KPROBE AT ADDRESS %p\n", (void*)(exit_pre_address));
++
++			// register the exit krpobe
++			if(register_kprobe(&process_exit_probe)){
++				printk(KERN_INFO "ERROR WHILE KEEPING KPROBE AT EXIT SYSCALL  %p\n", (void*)(exit_pre_address));
++				return -EINVAL;
++			}
++			counter++;			
++		}
++		// add entry to the global dumpstacklist
++		mutex_lock_interruptible (&list_add_lock);
++		list_add(&per_dev_node->dlist, &dump_stack_list);
++		mutex_unlock(&list_add_lock);
++		return (per_dev_node->dump_stackid);
++		return 1;
++
++	#else
++
++		return 0;
++
++	#endif
++        
++}
+diff -uNr kernel.old/lib/Kconfig.debug kernel.new/lib/Kconfig.debug
+--- kernel.old/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Kconfig.debug	2020-05-01 13:52:27.914318789 -0700
+@@ -1485,6 +1485,15 @@
+ 
+ menu "Runtime Testing"
+ 
++config DYNAMIC_DUMP_STACK
++	bool "Enable dynamic dump stack"
++	default n
++	help
++	  Enable this option to test the dyanamically adding the dump stack.
++
++	  If unsure, say N.
++
++
+ config LKDTM
+ 	tristate "Linux Kernel Dump Test Tool Module"
+ 	depends on DEBUG_FS
+@@ -1595,6 +1604,10 @@
+ 
+ endmenu # runtime tests
+ 
++
++
++
++
+ config PROVIDE_OHCI1394_DMA_INIT
+ 	bool "Remote debugging over FireWire early on boot"
+ 	depends on PCI && X86
+diff -uNr kernel.old/lib/Makefile kernel.new/lib/Makefile
+--- kernel.old/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ kernel.new/lib/Makefile	2020-05-01 13:52:27.918318789 -0700
+@@ -22,6 +22,8 @@
+ lib-y	+= kobject.o klist.o
+ obj-y	+= lockref.o
+ 
++obj-y   += dynamic_dump_stack.o	
++
+ obj-y += bcd.o div64.o sort.o parser.o halfmd4.o debug_locks.o random32.o \
+ 	 bust_spinlocks.o hexdump.o kasprintf.o bitmap.o scatterlist.o \
+ 	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iovec.o clz_ctz.o \
